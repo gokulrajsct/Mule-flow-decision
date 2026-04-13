@@ -1,0 +1,701 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:s3="http://www.mulesoft.org/schema/mule/s3"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:java="http://www.mulesoft.org/schema/mule/java"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:scripting="http://www.mulesoft.org/schema/mule/scripting"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/java http://www.mulesoft.org/schema/mule/java/current/mule-java.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/scripting http://www.mulesoft.org/schema/mule/scripting/current/mule-scripting.xsd
+        http://www.mulesoft.org/schema/mule/s3 http://www.mulesoft.org/schema/mule/s3/current/mule-s3.xsd">
+
+    <!-- ============================================================ -->
+    <!-- GLOBAL CONFIGURATIONS                                        -->
+    <!-- ============================================================ -->
+    
+    <!-- HTTP Listener - Receives incoming file uploads -->
+    <http:listener-config name="HTTP_Listener_Config">
+        <http:listener-connection 
+            host="0.0.0.0" 
+            port="${http.port}"
+            readTimeout="600000"/>
+    </http:listener-config>
+    
+    <!-- HTTP Request Config for AWS S3 -->
+    <!-- Key settings: streaming enabled, long timeouts for large files -->
+    <http:request-config name="S3_Request_Config" responseTimeout="300000">
+        <http:request-connection
+            host="s3.us-east-1.amazonaws.com"
+            port="443"
+            protocol="HTTPS"
+            streamResponse="true"
+            responseBufferSize="65536">
+        </http:request-connection>
+    </http:request-config>
+    
+    <!-- Properties -->
+    <configuration-properties file="config.yaml"/>
+
+    <!-- ============================================================ -->
+    <!-- FLOW 1: Simple Single PUT Upload (files < 100MB)            -->
+    <!-- Uses HTTP Requester with signed headers                      -->
+    <!-- ============================================================ -->
+	<flow name="simple-upload-flow">
+        <http:listener 
+            config-ref="HTTP_Listener_Config" 
+            path="/api/v2/upload/{bucketName}/{objectKey}"
+            allowedMethods="PUT"
+            responseStreamingMode="ALWAYS">
+			<http:response statusCode="200">
+                <http:headers><![CDATA[#[{"Content-Type": "application/json"}]]]></http:headers>
+            </http:response>
+        </http:listener>
+        
+        <logger level="INFO" message="Upload request: bucket=#[attributes.uriParams.bucketName], key=#[attributes.uriParams.objectKey], size=#[attributes.headers.'content-length']"/>
+        
+        <!-- Store metadata -->
+        <set-variable variableName="bucketName" value="#[attributes.uriParams.bucketName]"/>
+        <!-- objectKey: strip "/api/v2/upload/<bucket>/" prefix; handles multi-level keys -->
+        <set-variable variableName="objectK"
+            value="#[(attributes.requestPath splitBy ('/api/v2/upload/' ++ vars.bucketName ++ '/'))[1]]"/>
+            <set-variable variableName="objectKey"
+            value="#['source/'++ vars.objectK]" doc:name="SetObjectKey"/>
+        <set-variable variableName="contentType" value="#[attributes.headers.'content-type' default 'application/octet-stream']"/>
+        <set-variable variableName="contentLength" value="#[attributes.headers.'content-length' as Number]"/>
+        
+        <!-- Store payload as Binary (byte[]) so DataWeave does not decode it as
+             text/plain String regardless of Content-Type. The Java signer accepts
+             both InputStream and byte[] for the 'stream' key. -->
+        <set-variable variableName="fileStream" value="#[payload as Binary]"/>
+        
+        <!-- Step 1: Sign request + wrap stream using AWSS3V4SignerSDK.
+             Uses pure-JDK SigV4 (no deprecated Aws4Signer), virtual-hosted-style URL,
+             and STREAMING-AWS4-HMAC-SHA256-PAYLOAD with pre-computed Content-Length. -->
+        <java:invoke-static
+            class="com.mycompany.s3.AWSS3V4SignerSDK"
+            method="signRequest(Map)"
+            target="signingResult">
+            <java:args><![CDATA[#[{
+                arg0: {
+                    stream:               vars.fileStream,
+                    accessKey:            p('aws.s3.accessKey'),
+                    secretKey:            p('aws.s3.secretKey'),
+                    region:               p('aws.s3.region'),
+                    bucket:               vars.bucketName,
+                    objectKey:            vars.objectKey,
+                    contentType:          vars.contentType,
+                    contentLength:        vars.contentLength as String,
+                    computeContentLength: "true"
+                }
+            }]]]></java:args>
+        </java:invoke-static>
+
+        <!-- Step 2: Build virtual-hosted-style target URL (must match what was signed) -->
+        <set-variable variableName="targetUrl"
+            value="#['https://' ++ vars.bucketName ++ '.s3.' ++ p('aws.s3.region') ++ '.amazonaws.com/' ++ vars.objectKey]"/>
+
+        <!-- Step 3: Log full outgoing request before sending to S3 -->
+        <logger level="DEBUG" message="#['
+=== OUTGOING S3 REQUEST ===
+Method      : PUT
+URL         : ' ++ vars.targetUrl ++ '
+Bucket      : ' ++ vars.bucketName ++ '
+Object Key  : ' ++ vars.objectKey ++ '
+Content-Type: ' ++ vars.contentType ++ '
+Content-Len : ' ++ (vars.contentLength as String) ++ '
+--- Signed Headers ---
+' ++ write(vars.signingResult.headers, 'application/json') ++ '
+==========================']"/>
+
+        <!-- Step 4: PUT to S3 using the signed stream and headers.
+             requestStreamingMode=NEVER: Mule buffers the aws-chunked encoded stream.
+             Content-Length is pre-computed by the signer so no chunked transfer is emitted. -->
+        <http:request
+            method="PUT"
+            url="#[vars.targetUrl]"
+            requestStreamingMode="NEVER"
+            sendCorrelationId="NEVER"
+            config-ref="S3_Request_Config">
+            <http:body><![CDATA[#[vars.signingResult.stream]]]></http:body>
+            <http:headers><![CDATA[#[vars.signingResult.headers]]]></http:headers>
+            <http:response-validator>
+                <http:success-status-code-validator values="200,201"/>
+            </http:response-validator>
+        </http:request>
+
+        <!-- Step 6: Log S3 response -->
+        <logger level="DEBUG" message="#['
+=== S3 RESPONSE ===
+Status : ' ++ (attributes.statusCode as String) ++ '
+ETag   : ' ++ (attributes.headers.ETag default attributes.headers.etag default 'N/A') ++ '
+Headers: ' ++ write(attributes.headers, 'application/json') ++ '
+===================']"/>
+
+        <!-- Step 7: Build response -->
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "success",
+    bucket: vars.bucketName,
+    objectKey: vars.objectKey,
+    etag: attributes.headers.ETag default attributes.headers.etag,
+    size: vars.contentLength,
+    timestamp: now()
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <logger level="INFO" message="Upload completed: #[payload]"/>
+
+        <error-handler>
+            <on-error-propagate type="HTTP:*">
+                <logger level="ERROR" message="#['
+=== S3 ERROR RESPONSE ===
+Status     : ' ++ (error.errorMessage.attributes.statusCode default 'N/A' as String) ++ '
+Description: ' ++ error.description ++ '
+S3 Body    : ' ++ (error.errorMessage.payload as String default 'N/A') ++ '
+Headers    : ' ++ write(error.errorMessage.attributes.headers, 'application/json') ++ '
+=========================']"/>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "error",
+    message: error.description,
+    httpStatus: error.errorMessage.attributes.statusCode default 500,
+    s3ErrorBody: error.errorMessage.payload default null,
+    timestamp: now()
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- FLOW 2: SDK2 Upload — UNSIGNED-PAYLOAD, header-only signing -->
+    <!--   signHeadersOnly() signs metadata only; payload is passed  -->
+    <!--   directly to http:request — no DataWeave coercion.         -->
+    <!-- PUT /api/v2/upload/sdk2/{bucketName}/{objectKey}            -->
+    <!-- ============================================================ -->
+    <flow name="sdk2-upload-flow">
+        <http:listener
+            config-ref="HTTP_Listener_Config"
+            path="/api/v2/upload/sdk2/{bucketName}/{objectKey}"
+            allowedMethods="PUT"
+            responseStreamingMode="ALWAYS">
+            <http:response statusCode="200">
+                <http:headers><![CDATA[#[{"Content-Type": "application/json"}]]]></http:headers>
+            </http:response>
+        </http:listener>
+
+        <logger level="INFO" message="SDK2 upload request: bucket=#[attributes.uriParams.bucketName], key=#[attributes.uriParams.objectKey], size=#[attributes.headers.'content-length']"/>
+
+        <!-- Capture metadata — payload is NOT touched before the http:request -->
+        <set-variable variableName="bucketName"   value="#[attributes.uriParams.bucketName]"/>
+        <set-variable variableName="objectK"
+            value="#[(attributes.requestPath splitBy ('/api/v2/upload/sdk2/' ++ vars.bucketName ++ '/'))[1]]"/>
+        <set-variable variableName="objectKey"
+            value="#['source/' ++ vars.objectK]" doc:name="SetObjectKey"/>
+        <set-variable variableName="contentType"
+            value="#[attributes.headers.'content-type' default 'application/octet-stream']"/>
+        <set-variable variableName="contentLength"
+            value="#[attributes.headers.'content-length' default '']"/>
+
+        <!-- Sign headers only — stream is never passed to Java, so DataWeave
+             cannot coerce it. Returns Map<String,String> with:
+               Authorization, x-amz-date, x-amz-content-sha256,
+               Content-Type, Content-Length (unsigned). -->
+        <java:invoke-static
+            class="com.mycompany.s3.AWSS3V4SignerSDK"
+            method="signHeadersOnly(Map)"
+            target="signedHeaders">
+            <java:args><![CDATA[#[{
+                arg0: {
+                    accessKey:     p('aws.s3.accessKey'),
+                    secretKey:     p('aws.s3.secretKey'),
+                    region:        p('aws.s3.region'),
+                    bucket:        vars.bucketName,
+                    objectKey:     vars.objectKey,
+                    contentType:   vars.contentType,
+                    contentLength: vars.contentLength
+                }
+            }]]]></java:args>
+        </java:invoke-static>
+
+        <!-- Virtual-hosted-style URL (must match what was signed) -->
+        <set-variable variableName="targetUrl"
+            value="#['https://' ++ vars.bucketName ++ '.s3.' ++ p('aws.s3.region') ++ '.amazonaws.com/' ++ vars.objectKey]"/>
+
+        <logger level="DEBUG" message="#['
+=== SDK2 OUTGOING S3 REQUEST ===
+Method      : PUT
+URL         : ' ++ vars.targetUrl ++ '
+Bucket      : ' ++ vars.bucketName ++ '
+Object Key  : ' ++ vars.objectKey ++ '
+Content-Type: ' ++ vars.contentType ++ '
+Content-Len : ' ++ vars.contentLength ++ '
+--- Signed Headers ---
+' ++ write(vars.signedHeaders, 'application/json') ++ '
+================================']"/>
+
+        <!-- PUT to S3.
+             payload passed directly as body — Mule streams it to S3 natively.
+             requestStreamingMode=NEVER: sends Content-Length (from signedHeaders),
+               not Transfer-Encoding: chunked, which S3 does not support.
+             sendCorrelationId=NEVER: no Mule correlation header sent to S3. -->
+        <http:request
+            method="PUT"
+            url="#[vars.targetUrl]"
+            requestStreamingMode="NEVER"
+            sendCorrelationId="NEVER"
+            config-ref="S3_Request_Config">
+            <http:body><![CDATA[#[payload]]]></http:body>
+            <http:headers><![CDATA[#[vars.signedHeaders]]]></http:headers>
+            <http:response-validator>
+                <http:success-status-code-validator values="200,201"/>
+            </http:response-validator>
+        </http:request>
+
+        <logger level="DEBUG" message="#['
+=== SDK2 S3 RESPONSE ===
+Status : ' ++ (attributes.statusCode as String) ++ '
+ETag   : ' ++ (attributes.headers.ETag default attributes.headers.etag default 'N/A') ++ '
+Headers: ' ++ write(attributes.headers, 'application/json') ++ '
+========================']"/>
+
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "success",
+    bucket: vars.bucketName,
+    objectKey: vars.objectKey,
+    etag: attributes.headers.ETag default attributes.headers.etag,
+    timestamp: now()
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <logger level="INFO" message="SDK2 upload completed: #[write(payload, 'application/json')]"/>
+
+        <error-handler>
+            <on-error-propagate type="HTTP:*">
+                <logger level="ERROR" message="#['
+=== SDK2 S3 ERROR ===
+Status     : ' ++ (error.errorMessage.attributes.statusCode default 'N/A' as String) ++ '
+Description: ' ++ error.description ++ '
+S3 Body    : ' ++ (error.errorMessage.payload as String default 'N/A') ++ '
+Headers    : ' ++ write(error.errorMessage.attributes.headers, 'application/json') ++ '
+=====================']"/>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "error",
+    message: error.description,
+    httpStatus: error.errorMessage.attributes.statusCode default 500,
+    s3ErrorBody: error.errorMessage.payload default null,
+    timestamp: now()
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- FLOW 3: Multipart Upload (files > 100MB)                    -->
+    <!-- Orchestrates: Initiate -> Upload Parts -> Complete           -->
+    <!-- ============================================================ -->
+    
+    <flow name="multipart-upload-flow">
+        <http:listener
+            config-ref="HTTP_Listener_Config"
+            path="/api/v2/upload/large/{bucketName}/{objectKey}"
+            allowedMethods="PUT"
+            responseStreamingMode="ALWAYS"/>
+        
+        <logger level="INFO" message="Multipart upload: bucket=#[attributes.uriParams.bucketName], key=#[attributes.uriParams.objectKey], size=#[attributes.headers.'content-length']"/>
+        
+        <!-- Store metadata -->
+        <set-variable variableName="bucketName" value="#[attributes.uriParams.bucketName]"/>
+        <!-- objectKey: strip "/api/v2/upload/large/<bucket>/" prefix; handles multi-level keys -->
+        <set-variable variableName="objectKey"
+            value="#[(attributes.requestPath splitBy ('/api/v2/upload/large/' ++ vars.bucketName ++ '/'))[1]]"/>
+        <set-variable variableName="contentType" value="#[attributes.headers.'content-type' default 'application/octet-stream']"/>
+        <set-variable variableName="contentLength" value="#[attributes.headers.'content-length' as Number]"/>
+        <!-- Buffer the full payload into a byte[] once.
+             Rationale: Mule's ManagedCursorStreamProvider.openCursor() is lifecycle-
+             managed internally; reflection-based cursor opens (used by readPart to
+             slice byte ranges) fail both eagerly (during java:invoke-static) and
+             lazily (during http:request body transfer).  Storing byte[] sidesteps
+             the cursor issue completely — readPart creates a zero-copy
+             ByteArrayInputStream(bytes, offset, partLen) view, which Mule handles
+             reliably as a known-size body with no cursor involvement.
+             Memory: one copy of the file (e.g. 197 MB) lives for the duration of
+             the flow.  Ensure Studio JVM has at least -Xmx1g for files up to 512 MB.
+             (Run Configurations → VM arguments → -Xmx1g -XX:MaxMetaspaceSize=512m) -->
+        <set-variable variableName="fileStream" value="#[payload as Binary]"/>
+
+        <!-- STEP 1: Initiate Multipart Upload -->
+        <flow-ref name="initiate-multipart-subflow"/>
+        
+        <logger level="INFO" message="Multipart initiated: uploadId=#[vars.uploadId]"/>
+        
+        <!-- STEP 2: Upload Parts using scatter-gather or loop -->
+        <flow-ref name="upload-parts-subflow"/>
+        
+        <!-- STEP 3: Complete Multipart Upload -->
+        <flow-ref name="complete-multipart-subflow"/>
+        
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "success",
+    bucket: vars.bucketName,
+    objectKey: vars.objectKey,
+    etag: vars.finalETag,
+    uploadId: vars.uploadId,
+    parts: sizeOf(vars.partETags),
+    timestamp: now()
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        
+        <error-handler>
+            <on-error-propagate type="ANY">
+                <!-- Abort multipart on failure -->
+                <flow-ref name="abort-multipart-subflow"/>
+                <ee:transform>
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "error",
+    message: error.description,
+    uploadId: vars.uploadId default "N/A",
+    timestamp: now()
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-propagate>
+        </error-handler>
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- SUB-FLOW: Initiate Multipart Upload                         -->
+    <!-- ============================================================ -->
+    
+    <sub-flow name="initiate-multipart-subflow">
+        <java:invoke-static
+            class="com.mycompany.s3.AWSS3V4SignerSDK"
+            method="signMultipartInitiate(Map)"
+            target="initHeaders">
+            <java:args><![CDATA[#[{
+                arg0: {
+                    accessKey:   p('aws.s3.accessKey'),
+                    secretKey:   p('aws.s3.secretKey'),
+                    region:      p('aws.s3.region'),
+                    bucket:      vars.bucketName,
+                    objectKey:   vars.objectKey,
+                    contentType: vars.contentType
+                }
+            }]]]></java:args>
+        </java:invoke-static>
+
+        <!-- POST to initiate — virtual-hosted-style URL, empty body required by S3 -->
+        <http:request
+            method="POST"
+            url="#['https://' ++ vars.bucketName ++ '.s3.' ++ p('aws.s3.region') ++ '.amazonaws.com/' ++ vars.objectKey ++ '?uploads']"
+            requestStreamingMode="NEVER"
+            sendCorrelationId="NEVER"
+            config-ref="S3_Request_Config">
+            <http:body><![CDATA[#[null]]]></http:body>
+            <http:headers><![CDATA[#[vars.initHeaders]]]></http:headers>
+        </http:request>
+        
+        <!-- Extract UploadId from XML response.
+             Mule auto-parses the application/xml S3 response; read() must NOT be
+             called when payload is already an Object (same reason as finalETag below). -->
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="uploadId"><![CDATA[%dw 2.0
+output application/java
+ns s3 http://s3.amazonaws.com/doc/2006-03-01/
+---
+do {
+    var doc    = if (payload is Binary) read(payload, "application/xml") else payload
+    var rawId  = doc.s3#InitiateMultipartUploadResult.s3#UploadId
+    var str    = if (rawId is Array) rawId[0] as String else rawId as String
+    ---
+    trim(str)
+}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        
+        <!-- Initialize part tracking -->
+        <set-variable variableName="partETags" value="#[[]]"/>
+        <set-variable variableName="partNumber" value="#[1]"/>
+    </sub-flow>
+
+    <!-- ============================================================ -->
+    <!-- SUB-FLOW: Upload Parts (chunked)                            -->
+    <!-- ============================================================ -->
+    
+    <sub-flow name="upload-parts-subflow">
+        <!-- 
+            For true streaming of large files, you'd use:
+            1. Repeatable stream with chunking
+            2. Or batch processing with ObjectStore
+            
+            This example shows the pattern - in production, use
+            MuleSoft's streaming capabilities with the Batch module
+            or a custom Java component for chunking the stream.
+        -->
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="partSize"><![CDATA[%dw 2.0
+output application/java
+---
+26214400]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        
+        <!-- 
+            NOTE: For production multipart, implement chunking logic.
+            This pattern shows the HTTP request per-part:
+        -->
+        <foreach collection="#[(1 to ceil(vars.contentLength / vars.partSize))]">
+            <set-variable variableName="currentPart" value="#[payload]"/>
+
+            <!-- Calculate part size and offset for this part.
+                 Last part may be smaller than partSize.
+                 Offset = (partNumber - 1) * partSize — used by readPart to skip. -->
+            <ee:transform>
+                <ee:variables>
+                    <ee:set-variable variableName="currentPartSize"><![CDATA[%dw 2.0
+output application/java
+---
+min([vars.partSize, vars.contentLength - ((vars.currentPart - 1) * vars.partSize)])]]></ee:set-variable>
+                    <ee:set-variable variableName="partOffset"><![CDATA[%dw 2.0
+output application/java
+---
+(vars.currentPart - 1) * vars.partSize]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <!-- Open a fresh cursor positioned at partOffset and limited to
+                 currentPartSize bytes.  readPart() calls openCursor() on the
+                 CursorStreamProvider (which always rewinds to byte 0), then skips
+                 partOffset bytes, then returns a PartLimitedInputStream.
+                 This means each part sends exactly its correct 25 MB slice instead
+                 of the full 197 MB file — fixes both OOM and data corruption. -->
+            <java:invoke-static
+                class="com.mycompany.s3.AWSS3V4SignerSDK"
+                method="readPart(Map)"
+                target="partStream">
+                <java:args><![CDATA[#[{
+                    arg0: {
+                        provider: vars.fileStream,
+                        offset:   vars.partOffset as String,
+                        length:   vars.currentPartSize as String
+                    }
+                }]]]></java:args>
+            </java:invoke-static>
+
+            <!-- Sign part upload. Content-Length is added explicitly below (not in
+                 SignedHeaders, so it does not affect the signature). -->
+            <java:invoke-static
+                class="com.mycompany.s3.AWSS3V4SignerSDK"
+                method="signMultipartUploadPart(Map)"
+                target="partHeaders">
+                <java:args><![CDATA[#[{
+                    arg0: {
+                        accessKey:  p('aws.s3.accessKey'),
+                        secretKey:  p('aws.s3.secretKey'),
+                        region:     p('aws.s3.region'),
+                        bucket:     vars.bucketName,
+                        objectKey:  vars.objectKey,
+                        partNumber: vars.currentPart as String,
+                        uploadId:   vars.uploadId
+                    }
+                }]]]></java:args>
+            </java:invoke-static>
+
+            <logger level="DEBUG" doc:name="Logger1" doc:id="89487c59-a461-4e29-8f78-7bc85dbbd765" message="#['&#10;=== PART UPLOAD REQUEST ===&#10;Bucket      : ' ++ vars.bucketName ++ '&#10;Object Key  : ' ++ vars.objectKey ++ '&#10;Part        : ' ++ (vars.currentPart as String) ++ '&#10;PartSize    : ' ++ (vars.currentPartSize as String) ++ '&#10;Offset      : ' ++ (vars.partOffset as String) ++ '&#10;UploadId    : ' ++ vars.uploadId ++ '&#10;--- Signed Headers ---&#10;' ++ write(vars.partHeaders, 'application/json') ++ '&#10;==========================']" />
+
+            <!-- Upload part. Body = vars.partStream (byte-range slice from readPart).
+                 Content-Length injected alongside partHeaders so S3 and Mule agree on size.
+                 requestStreamingMode=NEVER: no Transfer-Encoding:chunked (S3 rejects it). -->
+            <http:request
+                method="PUT"
+                url="#['https://' ++ vars.bucketName ++ '.s3.' ++ p('aws.s3.region') ++ '.amazonaws.com/' ++ vars.objectKey ++ '?partNumber=' ++ vars.currentPart ++ '&amp;uploadId=' ++ vars.uploadId]"
+                requestStreamingMode="NEVER"
+                sendCorrelationId="NEVER"
+                config-ref="S3_Request_Config">
+                <http:body><![CDATA[#[vars.partStream]]]></http:body>
+                <http:headers><![CDATA[#[vars.partHeaders ++ {"Content-Length": vars.currentPartSize as String}]]]></http:headers>
+            </http:request>
+            
+            <!-- Collect ETag -->
+            <logger level="DEBUG" doc:name="Logger2" doc:id="b8cea70a-75b8-4141-a9b9-fd05fc3a415c" message="#['&#10;=== SDK2 S3 RESPONSE ===&#10;Status : ' ++ (attributes.statusCode as String) ++ '&#10;ETag   : ' ++ (attributes.headers.ETag default attributes.headers.etag default 'N/A') ++ '&#10;Headers: ' ++ write(attributes.headers, 'application/json') ++ '&#10;========================']" />
+			<ee:transform>
+                <ee:variables>
+                    <ee:set-variable variableName="partETags"><![CDATA[%dw 2.0
+output application/java
+---
+// Mule multi-map headers return List<String> in DataWeave; extract scalar with is Array check.
+// ETag from S3 is wrapped in quotes ("\"etag\"") — strip them so completeXml can add them back.
+vars.partETags + [{
+    partNumber: vars.currentPart,
+    etag: do {
+        var raw = attributes.headers.'ETag' default attributes.headers.'etag' default ""
+        var scalar = if (raw is Array) raw[0] as String else raw as String
+        ---
+        scalar replace "\"" with ""
+    }
+}]]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+            
+            <logger level="INFO" message="Uploaded part #[vars.currentPart]"/>
+        </foreach>
+    </sub-flow>
+
+    <!-- ============================================================ -->
+    <!-- SUB-FLOW: Complete Multipart Upload                         -->
+    <!-- ============================================================ -->
+    
+    <sub-flow name="complete-multipart-subflow">
+        <!-- Build completion XML -->
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="completeXml"><![CDATA[%dw 2.0
+output application/xml
+---
+{
+    CompleteMultipartUpload: {
+        (vars.partETags map {
+            Part: {
+                PartNumber: $.partNumber,
+                ETag: "\"" ++ (if ($.etag is Array) $.etag[0] as String else $.etag as String) ++ "\""
+            }
+        })
+    }
+}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+        
+        <!-- Sign complete request — UNSIGNED-PAYLOAD, no body hash needed -->
+        <java:invoke-static
+            class="com.mycompany.s3.AWSS3V4SignerSDK"
+            method="signMultipartComplete(Map)"
+            target="completeHeaders">
+            <java:args><![CDATA[#[{
+                arg0: {
+                    accessKey: p('aws.s3.accessKey'),
+                    secretKey: p('aws.s3.secretKey'),
+                    region:    p('aws.s3.region'),
+                    bucket:    vars.bucketName,
+                    objectKey: vars.objectKey,
+                    uploadId:  vars.uploadId
+                }
+            }]]]></java:args>
+        </java:invoke-static>
+
+        <!-- POST completion — virtual-hosted-style URL, no streaming -->
+        <http:request
+            method="POST"
+            url="#['https://' ++ vars.bucketName ++ '.s3.' ++ p('aws.s3.region') ++ '.amazonaws.com/' ++ vars.objectKey ++ '?uploadId=' ++ vars.uploadId]"
+            requestStreamingMode="NEVER"
+            sendCorrelationId="NEVER"
+            config-ref="S3_Request_Config">
+            <http:body><![CDATA[#[vars.completeXml]]]></http:body>
+            <http:headers><![CDATA[#[vars.completeHeaders]]]></http:headers>
+        </http:request>
+        
+        <!-- Extract final ETag.
+             Mule auto-parses the application/xml S3 response into a DataWeave Object,
+             so read() must NOT be called (it expects String|Binary, not Object).
+             Navigate the already-parsed document directly.
+             ETag from S3 is wrapped in quotes ("\"etag\"") — strip them. -->
+        <ee:transform>
+            <ee:variables>
+                <ee:set-variable variableName="finalETag"><![CDATA[%dw 2.0
+output application/java
+ns s3 http://s3.amazonaws.com/doc/2006-03-01/
+---
+do {
+    var doc  = if (payload is Binary) read(payload, "application/xml") else payload
+    var etag = doc.s3#CompleteMultipartUploadResult.s3#ETag
+    var str  = if (etag is Array) etag[0] as String else etag as String
+    ---
+    trim(str) replace "\"" with ""
+}]]></ee:set-variable>
+            </ee:variables>
+        </ee:transform>
+    </sub-flow>
+
+    <!-- ============================================================ -->
+    <!-- SUB-FLOW: Abort Multipart Upload (on error)                 -->
+    <!-- ============================================================ -->
+    
+    <sub-flow name="abort-multipart-subflow">
+        <try>
+            <java:invoke-static
+                class="com.mycompany.s3.AWSS3V4SignerSDK"
+                method="signMultipartAbort(Map)"
+                target="abortHeaders">
+                <java:args><![CDATA[#[{
+                    arg0: {
+                        accessKey: p('aws.s3.accessKey'),
+                        secretKey: p('aws.s3.secretKey'),
+                        region:    p('aws.s3.region'),
+                        bucket:    vars.bucketName,
+                        objectKey: vars.objectKey,
+                        uploadId:  vars.uploadId
+                    }
+                }]]]></java:args>
+            </java:invoke-static>
+
+            <http:request
+                method="DELETE"
+                url="#['https://' ++ vars.bucketName ++ '.s3.' ++ p('aws.s3.region') ++ '.amazonaws.com/' ++ vars.objectKey ++ '?uploadId=' ++ vars.uploadId]"
+                requestStreamingMode="NEVER"
+                sendCorrelationId="NEVER"
+                config-ref="S3_Request_Config">
+                <http:body><![CDATA[#[null]]]></http:body>
+                <http:headers><![CDATA[#[vars.abortHeaders]]]></http:headers>
+            </http:request>
+            
+            <logger level="WARN" message="Aborted multipart upload: #[vars.uploadId]"/>
+            
+            <error-handler>
+                <on-error-continue type="ANY">
+                    <logger level="ERROR" message="Failed to abort multipart: #[error.description]"/>
+                </on-error-continue>
+            </error-handler>
+        </try>
+    </sub-flow>
+
+</mule>
