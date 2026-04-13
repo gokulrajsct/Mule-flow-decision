@@ -340,18 +340,13 @@ output application/json
             value="#[(attributes.requestPath splitBy ('/api/v2/upload/large/' ++ vars.bucketName ++ '/'))[1]]"/>
         <set-variable variableName="contentType" value="#[attributes.headers.'content-type' default 'application/octet-stream']"/>
         <set-variable variableName="contentLength" value="#[attributes.headers.'content-length' as Number]"/>
-        <!-- Buffer the full payload into a byte[] once.
-             Rationale: Mule's ManagedCursorStreamProvider.openCursor() is lifecycle-
-             managed internally; reflection-based cursor opens (used by readPart to
-             slice byte ranges) fail both eagerly (during java:invoke-static) and
-             lazily (during http:request body transfer).  Storing byte[] sidesteps
-             the cursor issue completely — readPart creates a zero-copy
-             ByteArrayInputStream(bytes, offset, partLen) view, which Mule handles
-             reliably as a known-size body with no cursor involvement.
-             Memory: one copy of the file (e.g. 197 MB) lives for the duration of
-             the flow.  Ensure Studio JVM has at least -Xmx1g for files up to 512 MB.
-             (Run Configurations → VM arguments → -Xmx1g -XX:MaxMetaspaceSize=512m) -->
-        <set-variable variableName="fileStream" value="#[payload as Binary]"/>
+        <!-- Store the CursorStreamProvider reference.
+             "payload as Binary" does NOT materialize to byte[] for large binary
+             payloads in Mule 4 — it still stores the ManagedCursorStreamProvider.
+             Using plain payload is equivalent and avoids confusion.
+             readPart(Map) opens a fresh cursor lazily (inside http:request body
+             transfer), skips to the part offset, and reads exactly partSize bytes. -->
+        <set-variable variableName="fileStream" value="#[payload]"/>
 
         <!-- STEP 1: Initiate Multipart Upload -->
         <flow-ref name="initiate-multipart-subflow"/>
@@ -544,9 +539,12 @@ output application/java
 
             <logger level="DEBUG" doc:name="Logger1" doc:id="89487c59-a461-4e29-8f78-7bc85dbbd765" message="#['&#10;=== PART UPLOAD REQUEST ===&#10;Bucket      : ' ++ vars.bucketName ++ '&#10;Object Key  : ' ++ vars.objectKey ++ '&#10;Part        : ' ++ (vars.currentPart as String) ++ '&#10;PartSize    : ' ++ (vars.currentPartSize as String) ++ '&#10;Offset      : ' ++ (vars.partOffset as String) ++ '&#10;UploadId    : ' ++ vars.uploadId ++ '&#10;--- Signed Headers ---&#10;' ++ write(vars.partHeaders, 'application/json') ++ '&#10;==========================']" />
 
-            <!-- Upload part. Body = vars.partStream (byte-range slice from readPart).
-                 Content-Length injected alongside partHeaders so S3 and Mule agree on size.
-                 requestStreamingMode=NEVER: no Transfer-Encoding:chunked (S3 rejects it). -->
+            <!-- Upload part. Body = vars.partStream (byte[] slice from readPart).
+                 Mule computes Content-Length = array.length automatically for byte[] bodies —
+                 do NOT inject Content-Length manually here; doing so alongside Mule's own
+                 computation produces a duplicate/conflicting header that causes
+                 "Exception found while consuming stream" before the request reaches S3.
+                 requestStreamingMode=NEVER: prevents Transfer-Encoding:chunked (S3 rejects it). -->
             <http:request
                 method="PUT"
                 url="#['https://' ++ vars.bucketName ++ '.s3.' ++ p('aws.s3.region') ++ '.amazonaws.com/' ++ vars.objectKey ++ '?partNumber=' ++ vars.currentPart ++ '&amp;uploadId=' ++ vars.uploadId]"
@@ -554,7 +552,7 @@ output application/java
                 sendCorrelationId="NEVER"
                 config-ref="S3_Request_Config">
                 <http:body><![CDATA[#[vars.partStream]]]></http:body>
-                <http:headers><![CDATA[#[vars.partHeaders ++ {"Content-Length": vars.currentPartSize as String}]]]></http:headers>
+                <http:headers><![CDATA[#[vars.partHeaders]]]></http:headers>
             </http:request>
             
             <!-- Collect ETag -->

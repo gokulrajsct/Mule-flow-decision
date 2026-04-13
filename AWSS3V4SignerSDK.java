@@ -712,12 +712,9 @@ public final class AWSS3V4SignerSDK {
             throw new IllegalArgumentException("ctx['provider'] must not be null");
         }
 
-        // ── Fast path: byte[] (set via "payload as Binary" in Mule flow) ────────
-        // ByteArrayInputStream(buf, offset, len) is a zero-copy view into the
-        // original array — no extra heap beyond the one copy already stored in
-        // vars.fileStream.  Mule's http:request sees a known-size InputStream
-        // (available() == len) and sends it with Content-Length reliably.
-        // This sidesteps all ManagedCursorStreamProvider lifecycle issues.
+        // ── Fast path: byte[] ────────────────────────────────────────────────────
+        // Zero-copy view via ByteArrayInputStream. Mule's http:request buffers it
+        // to determine Content-Length (available() == length), then sends cleanly.
         if (provider instanceof byte[]) {
             byte[] bytes   = (byte[]) provider;
             int    iOffset = (int) Math.min(offset, (long) bytes.length);
@@ -725,10 +722,20 @@ public final class AWSS3V4SignerSDK {
             return new java.io.ByteArrayInputStream(bytes, iOffset, iLength);
         }
 
-        // ── Fallback: CursorStreamProvider / InputStream ─────────────────────────
-        // LazySkippingInputStream defers openCursor() to the first read() call
-        // (inside http:request body transfer) as ManagedCursorStreamProvider
-        // requires cursor opens to happen within the consuming component's context.
+        // ── CursorStreamProvider / InputStream path ──────────────────────────────
+        // vars.fileStream is Mule's ManagedCursorStreamProvider (payload as Binary
+        // does NOT materialize to byte[] for large binary payloads — it keeps the
+        // cursor stream reference).
+        //
+        // LazySkippingInputStream defers openCursor() to the first read() call,
+        // which happens during http:request body buffering (requestStreamingMode=NEVER
+        // causes Mule to buffer the InputStream to determine Content-Length).
+        // At that point the cursor lifecycle context is correct.
+        //
+        // Do NOT inject Content-Length in <http:headers> for part uploads — Mule
+        // computes it from the buffered stream size. Injecting it alongside Mule's
+        // own computation produced "Exception found while consuming stream" due to
+        // a duplicate/conflicting Content-Length header.
         return new LazySkippingInputStream(provider, offset, length);
     }
 
@@ -768,13 +775,29 @@ public final class AWSS3V4SignerSDK {
             } else {
                 // Mule 4 CursorStreamProvider (ManagedCursorStreamProvider etc.)
                 // openCursor() always rewinds to byte 0 of the original stream.
+                //
+                // CRITICAL — Java 17 strong encapsulation:
+                // provider.getClass() is ManagedCursorStreamProvider, which lives in
+                // org.mule.runtime.core.internal.streaming.bytes — a non-exported
+                // internal package.  Getting the Method via provider.getClass().getMethod()
+                // returns a Method whose declaring class is ManagedCursorStreamProvider
+                // (non-exported).  Method.invoke() on such a Method throws
+                // IllegalAccessException in Java 17 even for public methods.
+                //
+                // Fix: load openCursor() from the PUBLIC API interface
+                // CursorStreamProvider (org.mule.runtime.api.streaming.bytes — exported).
+                // The Method's declaring class is then in an exported package, so
+                // invoke() is permitted.  Java dynamic dispatch still calls the
+                // real ManagedCursorStreamProvider.openCursor() at runtime.
                 try {
-                    java.lang.reflect.Method m = provider.getClass().getMethod("openCursor");
+                    Class<?> iface = provider.getClass().getClassLoader()
+                        .loadClass("org.mule.runtime.api.streaming.bytes.CursorStreamProvider");
+                    java.lang.reflect.Method m = iface.getMethod("openCursor");
                     base = (InputStream) m.invoke(provider);
                 } catch (Exception e) {
                     throw new java.io.IOException(
                             "Failed to open cursor from " + provider.getClass().getName()
-                            + ": " + e.getMessage(), e);
+                            + " [" + e.getClass().getName() + "]: " + e.getMessage(), e);
                 }
             }
 
@@ -850,13 +873,18 @@ public final class AWSS3V4SignerSDK {
         private InputStream cursor() throws java.io.IOException {
             if (cursor == null) {
                 try {
-                    java.lang.reflect.Method m =
-                            provider.getClass().getMethod("openCursor");
+                    // Same Java-17-module fix as LazySkippingInputStream:
+                    // load openCursor() from the exported public interface so
+                    // that Method.invoke() passes the accessibility check.
+                    Class<?> iface = provider.getClass().getClassLoader()
+                        .loadClass("org.mule.runtime.api.streaming.bytes.CursorStreamProvider");
+                    java.lang.reflect.Method m = iface.getMethod("openCursor");
                     cursor = (InputStream) m.invoke(provider);
                 } catch (Exception e) {
                     throw new java.io.IOException(
                             "Failed to open cursor from "
-                            + provider.getClass().getName(), e);
+                            + provider.getClass().getName()
+                            + " [" + e.getClass().getName() + "]: " + e.getMessage(), e);
                 }
             }
             return cursor;
